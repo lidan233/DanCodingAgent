@@ -1,0 +1,1037 @@
+# Auto-Coder Multi-Agent System — Improvement Spec
+# ================================================
+#
+# This spec describes all modifications to the existing multi-agent
+# orchestration system (run.py, worker.py, scheduler.py, planner.py,
+# git_ops.py, progress.py, prompts/).
+#
+# The system currently works: Claude Code agents execute tasks in
+# parallel waves based on a DAG. The goal is to fix critical gaps
+# in security, reliability, context sharing, and review quality.
+
+
+# ============================================================
+# P0-1: Agent Permission Sandboxing (Fine-Grained)
+# ============================================================
+#
+# Problem:
+#   worker.py uses --dangerously-skip-permissions, giving every agent
+#   unrestricted access to the entire filesystem. An agent can read/write
+#   files outside project_dir, run arbitrary commands, or even rm -rf /.
+#
+# Goal:
+#   Implement a two-zone permission model:
+#     - project_dir: full read + write + execute
+#     - everywhere else: read-only (needed for reading installed packages,
+#       system headers, config files, etc.)
+#     - destructive commands: always denied
+#   Remove --dangerously-skip-permissions entirely.
+#
+# Permission Model (two zones):
+#
+#   ZONE 1 — project_dir (read + write + execute):
+#     - Read, Write, Edit, Glob, Grep: allowed for project_dir/**
+#     - Bash: allowed to run commands whose side effects stay within
+#       project_dir (e.g., pip install --target=., pytest, make,
+#       python scripts, touch/mkdir within project_dir)
+#
+#   ZONE 2 — everything else (read-only):
+#     - Read, Glob, Grep: allowed anywhere (agents need to read
+#       installed Python packages, system libs, docs, etc.)
+#     - Write, Edit: DENIED outside project_dir
+#     - Bash: read-only commands allowed (cat, ls, python -c,
+#       pip show, which, find, head, tail, etc.)
+#     - Bash: commands that write outside project_dir are DENIED
+#
+#   ALWAYS DENIED (regardless of zone):
+#     - rm -rf (except within project_dir for cleanup)
+#     - sudo, su, chmod 777, chown
+#     - git push, git remote (orchestrator handles git)
+#     - curl/wget to upload data (download is OK)
+#     - kill, pkill, killall (except own subprocesses)
+#     - Modifying ~/.bashrc, ~/.profile, /etc/*, ~/.ssh/*
+#
+# Implementation:
+#
+#   1. In worker.py, remove the --dangerously-skip-permissions flag
+#      from the claude CLI command.
+#
+#   2. Before launching each agent session, dynamically generate a
+#      .claude/settings.local.json inside project_dir. The permission
+#      rules must encode the two-zone model above.
+#      project_dir must be resolved to an absolute path.
+#      Example structure:
+#        {
+#          "permissions": {
+#            "allow": [
+#              "Read",
+#              "Glob",
+#              "Grep",
+#              "Write(project_dir/**)",
+#              "Edit(project_dir/**)",
+#              "Bash"
+#            ],
+#            "deny": [
+#              "Write(~/**)",
+#              "Edit(~/**)",
+#              "Bash(rm -rf /)",
+#              "Bash(sudo *)",
+#              "Bash(git push*)",
+#              "Bash(git remote*)"
+#            ]
+#          }
+#        }
+#      NOTE: The exact permission syntax must be verified against
+#      Claude Code's actual permission format. The above is illustrative.
+#      The implementation should test what syntax Claude Code accepts
+#      and adjust accordingly.
+#
+#   3. In coder_prompt.md, add explicit rules:
+#      "- You may READ any file on the system (installed packages, docs, etc.)
+#       - You may only WRITE/CREATE/MODIFY files inside the project directory
+#       - You MUST NOT run commands that modify files outside the project directory
+#       - You MUST NOT run git push, sudo, or any destructive system commands
+#       - The project directory is: {project_dir}"
+#
+#   4. Add a --sandbox flag (default: True) to run.py CLI args.
+#      When --no-sandbox is passed, fall back to --dangerously-skip-permissions
+#      for backward compatibility.
+#
+#   5. For review agents (P1-1), use an even tighter permission set:
+#      - Read, Glob, Grep: allowed everywhere (same as coder)
+#      - Write, Edit: DENIED everywhere (reviewers must not modify code)
+#      - Bash: only read-only commands + test command execution
+
+
+# ============================================================
+# P0-2: Per-Task Git Commit (Replace Wave-Level Commit)
+# ============================================================
+#
+# Problem:
+#   auto_commit() is called once per wave (run.py:776-780), so all tasks
+#   in a wave are mixed into a single commit. Downstream tasks cannot
+#   distinguish which files came from which upstream task. This also
+#   breaks _collect_task_artifacts() which uses git diff HEAD~1..HEAD.
+#
+# Goal:
+#   Each task gets its own commit immediately after completion.
+#   This gives clean per-task diffs for context sharing and review.
+#
+# Implementation:
+#
+#   1. In execute_task() (run.py:481), after a task succeeds and
+#      save_task_summary() is called, immediately run:
+#        auto_commit(project_dir, f"Task #{task_id}: {description[:50]}")
+#      Store the commit hash in the task result dict as "commit_hash".
+#
+#   2. Remove the wave-level auto_commit call at run.py:776-780.
+#      Optionally keep a lightweight "end of wave" tag/marker commit
+#      if there are unstaged changes.
+#
+#   3. In task_list.json, add a "commit_hash" field to each task.
+#      update_tasks_from_results() should persist this.
+#
+#   4. Update _collect_task_artifacts() to use the task's own commit hash:
+#        git diff {parent_hash}..{task_hash}
+#      instead of the unreliable HEAD~1..HEAD.
+
+
+# ============================================================
+# P0-3: Reliable Context Sharing Between Tasks
+# ============================================================
+#
+# Problem:
+#   save_task_summary() (run.py:51-90) extracts file info by regex-matching
+#   keywords like "created", "wrote" in agent output text. This is fragile
+#   and depends on Claude's wording. If the output format changes, context
+#   is lost entirely.
+#
+# Goal:
+#   Use git diff as the ground truth for what a task changed. Also let
+#   downstream agents self-explore the codebase rather than relying solely
+#   on passed-in summaries.
+#
+# Implementation:
+#
+#   1. Replace the keyword-regex approach in save_task_summary() with
+#      git-based extraction:
+#        - After per-task commit (P0-2), run:
+#            git diff --stat {before_hash}..{after_hash}
+#            git diff {before_hash}..{after_hash}
+#        - Save a structured summary:
+#            {
+#              "task_id": N,
+#              "commit_hash": "abc123",
+#              "files_created": ["a.py", "b.py"],
+#              "files_modified": ["c.py"],
+#              "diff_stat": "3 files changed, 120 insertions(+), 5 deletions(-)",
+#              "key_changes": "<abbreviated diff or agent's final message>"
+#            }
+#        - Write this as .context/task_{id}_summary.json (JSON, not markdown).
+#
+#   2. In load_dependency_context(), read the JSON summaries and format
+#      them into a concise context block for the downstream agent prompt.
+#      Include file lists and diff stats, but NOT full diffs (too long).
+#
+#   3. In coder_prompt.md, add a Step 1.5 after Orient:
+#      "Check what your dependency tasks produced:
+#       - Read the files listed in the dependency context below
+#       - Use Glob/Grep to understand interfaces and exports
+#       - Do NOT assume file contents from the summary alone"
+#
+#   4. Keep the agent's final text message as a secondary context source,
+#      but do not rely on keyword extraction from it.
+
+
+# ============================================================
+# P1-1: Droid-Based Review (Replace HTTP API Review)
+# ============================================================
+#
+# Problem:
+#   The current review system calls GPT-5.2-Codex via raw HTTP API
+#   (_call_llm_review). The reviewer can only see text artifacts that
+#   are manually collected and pasted into a prompt. It cannot:
+#     - Read actual files on disk
+#     - Run test commands to verify
+#     - Grep for related code or imports
+#     - Check if interfaces match between tasks
+#
+# Goal:
+#   Replace the HTTP-based review with a Claude Code agent (droid)
+#   that runs as a review session, using read-only tools.
+#   This reviewer can actually explore the codebase and run tests.
+#
+# Implementation:
+#
+#   1. Create a new prompt template: prompts/review_prompt.md
+#      Content:
+#        "You are a CODE REVIEWER in a multi-agent system.
+#         Task #{task_id} has been completed: {task_description}
+#         Test command: {test_command}
+#
+#         Your job:
+#         1. Read the files that were created/modified for this task
+#         2. Run the test command and check if it passes
+#         3. Check for bugs, logic errors, security issues, missing edge cases
+#         4. Check that imports and interfaces are consistent
+#         5. Output your verdict as a single JSON line:
+#            REVIEW_RESULT: {"passed": true/false, "issues": "description or NONE"}
+#
+#         Rules:
+#         - Do NOT modify any files
+#         - Do NOT run git commands
+#         - You may read any file and run the test command
+#         - Be strict but fair — only flag real issues"
+#
+#   2. In review_and_fix_task(), replace _call_llm_review() with:
+#        run_claude_session(
+#            prompt=review_prompt,
+#            project_dir=project_dir,
+#            model=review_model,    # configurable, default claude-sonnet-4-6
+#            task_id=task_id,
+#            allowed_tools="Bash Read Glob Grep",  # read-only, no Write/Edit
+#        )
+#      Parse the REVIEW_RESULT: JSON line from the agent's output.
+#
+#   3. Remove _call_llm_review(), _collect_task_artifacts(), and the
+#      urllib-based HTTP call. Remove REVIEW_MODEL constant.
+#      The review model should be a CLI argument: --review-model
+#      (default: claude-sonnet-4-6).
+#
+#   4. Keep the fix loop: if review fails, send fix prompt to a
+#      write-capable Claude agent (existing logic), then re-review.
+#
+#   5. Add --review-model CLI arg to run.py's argparse.
+#
+#   6. Delete _get_proxy_config() — no longer needed for review.
+#      (Keep it only if other features still use it.)
+
+
+# ============================================================
+# P1-2: Multi-Reviewer Cross-Validation
+# ============================================================
+#
+# Problem:
+#   Current review is single-point: one model, one perspective.
+#   If the reviewer misses something or the API fails, the task
+#   passes unchecked (default to passed=True on error).
+#
+# Goal:
+#   Support multiple reviewers running in parallel with different
+#   review perspectives. Require consensus to pass.
+#
+# Implementation:
+#
+#   1. Create multiple review prompt templates:
+#      - prompts/review_functional.md — checks correctness, logic, tests
+#      - prompts/review_security.md — checks input validation, injection,
+#        boundary conditions, error handling
+#      (The default single-reviewer mode uses review_prompt.md from P1-1.)
+#
+#   2. Add --review-mode flag to run.py:
+#      - "single" (default): one reviewer, same as P1-1
+#      - "cross": two reviewers in parallel (functional + security)
+#      Both reviewers must pass for the task to pass.
+#
+#   3. In review_and_fix_task(), when mode is "cross":
+#        - Launch two review agents in parallel using ThreadPoolExecutor
+#        - Collect both REVIEW_RESULT outputs
+#        - Task passes only if BOTH passed=true
+#        - If either fails, concatenate their issues and send to fix agent
+#
+#   4. Add inter-task compatibility check:
+#      After all tasks in a wave complete, run a lightweight
+#      "integration review" agent that checks:
+#        - Import consistency across changed files
+#        - Interface compatibility (function signatures, class APIs)
+#        - No duplicate/conflicting implementations
+#      This replaces the current text-based detect_file_conflicts()
+#      with a semantic-level check.
+
+
+# ============================================================
+# P1-3: Git Worktree Isolation for Parallel Tasks
+# ============================================================
+#
+# Problem:
+#   All parallel agents in a wave work on the same filesystem.
+#   If Task A and Task B both modify the same file, they overwrite
+#   each other. detect_file_conflicts() only detects this after
+#   the fact — it does not prevent it.
+#
+# Goal:
+#   Each parallel task runs in its own git worktree. After completion,
+#   changes are merged back to the main branch. Conflicts are detected
+#   at merge time with proper git conflict resolution.
+#
+# Implementation:
+#
+#   1. In git_ops.py, add:
+#      - create_worktree(project_dir, task_id) -> Path:
+#          branch = f"task-{task_id}"
+#          worktree_dir = project_dir / ".worktrees" / f"task_{task_id}"
+#          git worktree add {worktree_dir} -b {branch}
+#          return worktree_dir
+#
+#      - merge_worktree(project_dir, task_id) -> dict:
+#          git checkout main
+#          git merge task-{task_id} --no-edit
+#          # If conflict: return {"conflict": True, "files": [...]}
+#          # If success: return {"conflict": False, "commit_hash": "..."}
+#          # Cleanup: git worktree remove {worktree_dir}
+#
+#      - cleanup_worktree(project_dir, task_id):
+#          git worktree remove .worktrees/task_{task_id} --force
+#          git branch -D task-{task_id}
+#
+#   2. In execute_task(), when worktree isolation is enabled:
+#      - Before running claude session: create_worktree()
+#      - Run the agent in the worktree directory (not project_dir)
+#      - After success: merge_worktree() back to main
+#      - If merge conflict: mark task for manual resolution or retry
+#
+#   3. Add --worktree-isolation flag to run.py (default: False).
+#      When enabled, each task gets its own worktree.
+#      This is only useful when max_workers > 1.
+#
+#   4. Remove detect_file_conflicts() from run.py — git merge
+#      handles this properly now.
+#
+#   5. Add .worktrees/ to .gitignore in git_ops.py.
+
+
+# ============================================================
+# P2-1: Dynamic Task Graph Modification
+# ============================================================
+#
+# Problem:
+#   The NEW_TASK: marker system (run.py:221-260) is fragile:
+#   - Depends on exact text format in agent output
+#   - No validation that new tasks don't create cycles
+#   - No way to split, merge, or cancel existing tasks
+#   - New tasks are only extracted after a wave completes
+#
+# Goal:
+#   Allow controlled runtime modification of the task graph with
+#   proper validation.
+#
+# Implementation:
+#
+#   1. Replace the NEW_TASK: text marker with a structured approach:
+#      Agents write to a well-known file instead of outputting markers:
+#        .context/task_{id}_proposals.json
+#      Format:
+#        {
+#          "add": [
+#            {"description": "...", "depends_on": [...], "test_command": "..."}
+#          ],
+#          "split": {
+#            "original_task_id": N,
+#            "into": [
+#              {"description": "part A...", "test_command": "..."},
+#              {"description": "part B...", "test_command": "..."}
+#            ]
+#          },
+#          "cancel": [task_id_1, task_id_2]
+#        }
+#
+#   2. In run_multi_agent(), after each wave, scan for proposal files:
+#      - Validate: no cycles, no canceling done tasks, no invalid deps
+#      - Apply valid proposals to task_list.json
+#      - Log rejected proposals with reasons
+#      - Delete processed proposal files
+#
+#   3. Add a apply_task_proposals() function to scheduler.py that:
+#      - Assigns IDs to new tasks
+#      - Validates the resulting DAG (no cycles)
+#      - Handles split: mark original as "split", add sub-tasks with
+#        the original's dependencies
+#      - Handles cancel: mark as "skipped" with reason
+#
+#   4. Update coder_prompt.md to document the proposal file format
+#      so agents know how to use it.
+
+
+# ============================================================
+# P2-2: Improved File Conflict Detection (Keep as Fallback)
+# ============================================================
+#
+# Problem:
+#   detect_file_conflicts() (run.py:156-214) parses agent output text
+#   for file mentions using keyword matching. This is unreliable and
+#   produces false positives (e.g., "modified the config" matches
+#   even when no file was changed).
+#
+# Goal:
+#   If git worktree isolation (P1-3) is not enabled, provide a reliable
+#   fallback conflict detection using git.
+#
+# Implementation:
+#
+#   1. Replace the keyword-based approach with git-based detection:
+#      - Before each wave, record: before_hash = git rev-parse HEAD
+#      - After each task commits (per P0-2), record its changed files:
+#          git diff --name-only {before_hash}..{task_hash}
+#      - Compare file lists across tasks in the same wave
+#      - Report actual overlaps, not text-guessed ones
+#
+#   2. When a conflict is detected:
+#      - Log the conflicting files and task IDs
+#      - Show the actual diffs for the conflicted files
+#      - Optionally: launch a merge-resolution agent to fix conflicts
+
+
+# ============================================================
+# P2-3: Test Timeout and Session Timeout Enforcement
+# ============================================================
+#
+# Problem:
+#   --test-timeout and --session-timeout are accepted as CLI args
+#   (run.py:836-843) but never passed to worker.py or used anywhere.
+#   The agent session has no timeout enforcement.
+#
+# Goal:
+#   Actually enforce these timeouts.
+#
+# Implementation:
+#
+#   1. Pass session_timeout to run_claude_session() in worker.py.
+#      Use subprocess.Popen with a timeout on process.wait():
+#        process.wait(timeout=session_timeout)
+#      If TimeoutExpired: process.kill(), return exit_code=-1.
+#
+#   2. Pass test_timeout to the agent via the prompt or environment.
+#      In coder_prompt.md, inject:
+#        "When running test commands, use a timeout of {test_timeout}s"
+#      Or wrap test commands in the prompt:
+#        "timeout {test_timeout} {test_command}"
+#
+#   3. Wire the timeout values through:
+#      run_multi_agent() -> run_wave() -> execute_task() -> run_claude_session()
+
+
+# ============================================================
+# Summary of All Changes
+# ============================================================
+#
+# Files to modify:
+#   - worker.py: remove --dangerously-skip-permissions, add permission
+#     generation, add session timeout, accept review-only tool sets
+#   - run.py: per-task commit, git-based context sharing, droid review,
+#     cross-validation, worktree isolation, task proposals, timeout wiring,
+#     new CLI args (--sandbox, --review-model, --review-mode,
+#     --worktree-isolation)
+#   - scheduler.py: add apply_task_proposals(), add commit_hash field handling
+#   - git_ops.py: add create_worktree(), merge_worktree(), cleanup_worktree(),
+#     update .gitignore
+#   - planner.py: no changes needed
+#   - progress.py: no changes needed
+#   - test_changes.py: update tests for all new functionality
+#
+# Files to create:
+#   - prompts/review_prompt.md: single-reviewer prompt template
+#   - prompts/review_functional.md: functional review perspective
+#   - prompts/review_security.md: security review perspective
+#
+# Files to delete:
+#   - None (all changes are modifications to existing files)
+#
+# New CLI arguments:
+#   --sandbox / --no-sandbox       (default: True)
+#   --review-model MODEL           (default: claude-sonnet-4-6)
+#   --review-mode single|cross     (default: single)
+#   --worktree-isolation           (default: False)
+#
+# Priority order for implementation:
+#   P0: Permission sandboxing, per-task commit, reliable context sharing
+#   P1: Droid review, cross-validation, worktree isolation
+#   P2: Dynamic task graph, improved conflict detection, timeout enforcement
+
+
+# ============================================================
+# P1-4: Cost Budget and Circuit Breaker
+# ============================================================
+#
+# Problem:
+#   There is no spending limit. If an agent loops or the DAG has many
+#   tasks, the total cost can spiral without any check. The operator
+#   has no way to set a maximum budget.
+#
+# Goal:
+#   Add a --max-cost flag that stops execution when the total cost
+#   exceeds the budget. Also add per-task cost tracking to detect
+#   runaway agents.
+#
+# Implementation:
+#
+#   1. Add --max-cost CLI arg (float, default: None = unlimited).
+#
+#   2. In run_multi_agent(), after each wave, check:
+#        if max_cost and total_cost >= max_cost:
+#            print("Budget exhausted")
+#            break
+#
+#   3. Add per-task cost limit: if a single task costs more than
+#      --max-task-cost (default: None), mark it as failed instead
+#      of retrying. This prevents a single broken task from consuming
+#      the entire budget.
+#
+#   4. Log cumulative cost after every task (not just every wave)
+#      for better visibility.
+
+
+# ============================================================
+# P1-5: Graceful Interrupt and Resume
+# ============================================================
+#
+# Problem:
+#   When the user hits Ctrl+C, the system catches KeyboardInterrupt
+#   but running agents (subprocesses) may not be properly cleaned up.
+#   Stale in_progress tasks are recovered on restart, but there is no
+#   guarantee that the agent subprocess was actually terminated.
+#
+# Goal:
+#   Clean shutdown: on Ctrl+C, send SIGTERM to all running agent
+#   subprocesses, wait for them to exit, then save state.
+#
+# Implementation:
+#
+#   1. In worker.py, track the subprocess.Popen object. Expose a
+#      cancel() method or store the process in a shared registry.
+#
+#   2. In run_wave(), register a signal handler for SIGINT/SIGTERM
+#      that calls process.terminate() on all running agents.
+#
+#   3. After termination, mark those tasks as "pending" (not "failed")
+#      so they can be retried on next run.
+#
+#   4. Save task_list.json state before exiting.
+
+
+# ============================================================
+# P2-4: Structured Agent Output Protocol
+# ============================================================
+#
+# Problem:
+#   Multiple features rely on parsing agent text output for structured
+#   data (NEW_TASK: markers, REVIEW_RESULT: markers, file change
+#   detection via keywords). This is fragile and breaks if the agent's
+#   wording changes.
+#
+# Goal:
+#   Define a standard protocol for agents to emit structured data
+#   alongside their natural language output.
+#
+# Implementation:
+#
+#   1. Define a convention: agents write structured output to files
+#      instead of embedding it in text output.
+#      - .context/task_{id}_result.json — task completion metadata
+#      - .context/task_{id}_proposals.json — new task proposals (P2-1)
+#      - .review/task_{id}_verdict.json — review verdict (P1-1)
+#
+#   2. In worker.py, after a session completes, check for these files
+#      and include their contents in the result dict.
+#
+#   3. In coder_prompt.md, instruct agents to write these files:
+#      "When you complete your task, write a summary to:
+#         .context/task_{task_id}_result.json
+#       Format: {"files_created": [...], "files_modified": [...],
+#                "exports": [...], "notes": "..."}"
+#
+#   4. This replaces all text-parsing logic with file-reading logic,
+#      which is deterministic and reliable.
+
+
+# ============================================================
+# P2-5: Planner Quality — Spec Validation and Re-Planning
+# ============================================================
+#
+# Problem:
+#   The planner (planner.py) generates a task DAG in a single shot.
+#   If the spec is ambiguous or the planner misunderstands it, the
+#   resulting DAG may have:
+#   - Tasks that are too large or too vague
+#   - Missing tasks (incomplete coverage of the spec)
+#   - Wrong dependencies
+#   There is no validation step between planning and execution.
+#
+# Goal:
+#   Add a review step after planning, and support re-planning.
+#
+# Implementation:
+#
+#   1. After generate_task_dag() produces the task list, run a
+#      "plan review" agent that checks:
+#      - Does every requirement in app_spec.txt have a corresponding task?
+#      - Are task descriptions specific enough for an agent to act on?
+#      - Are dependencies correct (no missing deps, no unnecessary deps)?
+#      - Is the parallelism reasonable (not everything sequential)?
+#
+#   2. Add --review-plan flag (default: False). When enabled, the
+#      plan review agent can modify the task list before execution begins.
+#
+#   3. Add --replan flag. When used, delete existing task_list.json
+#      and regenerate from scratch (useful when spec changes).
+
+
+# ============================================================
+# P2-6: Progress Dashboard (Real-Time Monitoring)
+# ============================================================
+#
+# Problem:
+#   print_progress() only shows a static text progress bar.
+#   When multiple agents run in parallel, the output is interleaved
+#   and hard to follow. There is no way to see which agent is doing
+#   what in real time.
+#
+# Goal:
+#   Provide a clearer real-time view of multi-agent execution.
+#
+# Implementation:
+#
+#   1. Write a progress state file: .progress/state.json
+#      Updated after every significant event (task start, tool call,
+#      task complete, review start, etc.):
+#        {
+#          "wave": 3,
+#          "agents": [
+#            {"task_id": 5, "status": "running", "duration_s": 45,
+#             "last_tool": "Edit", "cost_usd": 0.12},
+#            {"task_id": 6, "status": "reviewing", "duration_s": 12}
+#          ],
+#          "completed": 8, "total": 15, "total_cost": 1.23
+#        }
+#
+#   2. Optionally: add a --dashboard flag that launches a simple
+#      terminal UI (using curses or rich) showing live agent status.
+#      This is a nice-to-have, not critical.
+#
+#   3. At minimum: prefix each agent's log output with a colored
+#      tag so interleaved output is readable:
+#        [Task#5] ┌─ Tool: Edit
+#        [Task#6] Writing main.py...
+#        [Task#5] └─ Result: OK
+
+
+# ============================================================
+# Updated Summary of All Changes
+# ============================================================
+#
+# Files to modify:
+#   - worker.py: remove --dangerously-skip-permissions, add two-zone
+#     permission generation, add session timeout, add process tracking
+#     for graceful shutdown, accept review-only tool sets
+#   - run.py: per-task commit, git-based context sharing, droid review,
+#     cross-validation, worktree isolation, task proposals, timeout wiring,
+#     cost budget, graceful interrupt, new CLI args
+#   - scheduler.py: add apply_task_proposals(), add commit_hash field handling
+#   - git_ops.py: add create_worktree(), merge_worktree(), cleanup_worktree(),
+#     update .gitignore
+#   - planner.py: add plan review step (P2-5)
+#   - progress.py: add state file writing, improve log formatting (P2-6)
+#   - test_changes.py: update tests for all new functionality
+#
+# Files to create:
+#   - prompts/review_prompt.md: single-reviewer prompt template
+#   - prompts/review_functional.md: functional review perspective
+#   - prompts/review_security.md: security review perspective
+#
+# Files to delete:
+#   - None (all changes are modifications to existing files)
+#
+# New CLI arguments:
+#   --sandbox / --no-sandbox       (default: True)
+#   --review-model MODEL           (default: claude-sonnet-4-6)
+#   --review-mode single|cross     (default: single)
+#   --worktree-isolation           (default: False)
+#   --max-cost FLOAT               (default: None = unlimited)
+#   --max-task-cost FLOAT          (default: None = unlimited)
+#   --review-plan                  (default: False)
+#   --replan                       (default: False)
+#   --dashboard                    (default: False)
+#
+# Full priority order:
+#   P0: Permission sandboxing (two-zone), per-task commit, reliable context sharing,
+#       subprocess deadlock fix, task_list.json race condition fix
+#   P1: Droid review, cross-validation, worktree isolation, cost budget, graceful interrupt
+#   P2: Dynamic task graph, improved conflict detection, timeout enforcement,
+#       structured output protocol, planner quality, progress dashboard
+
+
+# ============================================================
+# P0-4: Fix Subprocess Deadlock in worker.py
+# ============================================================
+#
+# Problem:
+#   worker.py iterates over process.stdout line by line (line 73),
+#   then reads process.stderr AFTER the stdout loop finishes (line 137).
+#   This is a classic Python subprocess deadlock pattern:
+#     - If the subprocess writes enough to stderr to fill the OS pipe
+#       buffer (~64KB on Linux), it blocks waiting for stderr to be read
+#     - But our code won't read stderr until stdout is done
+#     - Meanwhile stdout may also block if the subprocess stops producing
+#   Python's own subprocess docs explicitly warn about this.
+#
+# Goal:
+#   Read stdout and stderr concurrently to prevent deadlock.
+#
+# Implementation:
+#
+#   1. Use a separate thread to read stderr while the main thread
+#      reads stdout:
+#        import threading
+#        stderr_lines = []
+#        def read_stderr():
+#            for line in process.stderr:
+#                stderr_lines.append(line)
+#        t = threading.Thread(target=read_stderr, daemon=True)
+#        t.start()
+#        # ... main stdout reading loop ...
+#        t.join(timeout=5)
+#
+#   2. Alternatively, redirect stderr to stdout (subprocess.STDOUT)
+#      if we don't need to separate them. But stream-json mode puts
+#      structured data on stdout, so mixing may break JSON parsing.
+#      Prefer the threading approach.
+#
+#   3. Add a bounded buffer for all_assistant_text to prevent OOM
+#      on very large outputs:
+#        MAX_ASSISTANT_TEXT_CHARS = 500_000  # ~500KB total
+#        total_chars = 0
+#        # In the append loop:
+#        if total_chars < MAX_ASSISTANT_TEXT_CHARS:
+#            all_assistant_text.append(text)
+#            total_chars += len(text)
+
+
+# ============================================================
+# P0-5: Fix Race Condition on task_list.json
+# ============================================================
+#
+# Problem:
+#   Multiple threads in a wave can read/write task_list.json
+#   simultaneously via load_tasks()/save_tasks(). This causes:
+#     - Lost status updates (thread A overwrites thread B's changes)
+#     - Partial JSON reads (corrupted file during write)
+#     - Wrong task state (failed tasks shown as done, or vice versa)
+#
+# Goal:
+#   Make task_list.json access thread-safe.
+#
+# Implementation:
+#
+#   1. Add a threading.Lock to scheduler.py:
+#        _task_file_lock = threading.Lock()
+#
+#   2. Wrap load_tasks() and save_tasks() with the lock:
+#        def load_tasks(project_dir):
+#            with _task_file_lock:
+#                ... existing code ...
+#
+#        def save_tasks(project_dir, tasks):
+#            with _task_file_lock:
+#                ... existing code ...
+#
+#   3. Use atomic file write in save_tasks() to prevent partial reads:
+#        - Write to task_list.json.tmp first
+#        - Then os.replace() to atomically rename
+#        This ensures readers always see a complete file.
+#
+#   4. Also add file-level locking (fcntl.flock) for safety against
+#      multiple process instances running on the same project_dir.
+
+
+# ============================================================
+# P0-6: Git Operation Thread Safety
+# ============================================================
+#
+# Problem:
+#   git_ops.py's auto_commit() is not thread-safe. When multiple
+#   tasks finish near-simultaneously in a wave (with per-task commit
+#   from P0-2), concurrent git add/commit calls will race:
+#     - git add -A from task A includes task B's files
+#     - Two concurrent git commit calls fail or produce wrong commits
+#   git's internal index lock (.git/index.lock) will cause one call
+#   to fail, but there is no retry logic.
+#
+# Goal:
+#   Serialize all git operations to prevent races.
+#
+# Implementation:
+#
+#   1. Add a threading.Lock to git_ops.py:
+#        _git_lock = threading.Lock()
+#
+#   2. Wrap auto_commit() and all git-mutating operations with it:
+#        def auto_commit(project_dir, message):
+#            with _git_lock:
+#                ... existing code ...
+#
+#   3. When worktree isolation (P1-3) is enabled, each task has its
+#      own git directory, so the lock is only needed for merge operations
+#      back to the main branch.
+
+
+# ============================================================
+# P1-6: Planner Task Validation
+# ============================================================
+#
+# Problem:
+#   planner.py parses JSON from Claude's output but does not validate
+#   that each task dict has all required fields. If a task is missing
+#   "id", "description", or "test_command", downstream code will fail
+#   with unhelpful KeyError exceptions.
+#
+#   Also, the JSON extraction regex (line 182: r'(\[[\s\S]*\])') is
+#   greedy and can match from the first [ to the last ] in the entire
+#   text, producing invalid JSON if there are multiple arrays.
+#
+# Goal:
+#   Validate task structure after parsing. Fix regex to be more precise.
+#
+# Implementation:
+#
+#   1. After JSON extraction, validate each task dict:
+#        REQUIRED_FIELDS = {"id", "description", "depends_on", "test_command", "status"}
+#        for task in tasks:
+#            missing = REQUIRED_FIELDS - task.keys()
+#            if missing:
+#                # Fill defaults or raise error
+#                task.setdefault("depends_on", [])
+#                task.setdefault("test_command", "echo 'no test'")
+#                task.setdefault("status", "pending")
+#                task.setdefault("attempts", 0)
+#                task.setdefault("error_log", "")
+#
+#   2. Fix the greedy regex: try multiple extraction strategies in order:
+#      a) Direct json.loads() on full text
+#      b) Extract from ```json ... ``` code blocks
+#      c) Find JSON array using bracket matching (count [ and ] depth)
+#         instead of greedy regex
+#
+#   3. Validate that task IDs are unique and positive integers.
+#
+#   4. Validate that all depends_on references point to existing task IDs.
+
+
+# ============================================================
+# P1-7: Dynamic Task DAG Validation
+# ============================================================
+#
+# Problem:
+#   validate_dag() is only called once during planning (planner.py:142).
+#   Dynamic tasks added at runtime via NEW_TASK: markers (or the
+#   proposal system from P2-1) are never validated. An agent can inject
+#   tasks that create dependency cycles, causing the execution loop
+#   to stall forever.
+#
+# Goal:
+#   Validate the DAG after every modification.
+#
+# Implementation:
+#
+#   1. In run_multi_agent(), after extract_new_tasks() adds new tasks
+#      (or apply_task_proposals() in P2-1), call validate_dag():
+#        tasks = load_tasks(project_dir)
+#        errors = validate_dag(tasks)
+#        if errors:
+#            # Remove the offending new tasks and log warnings
+#            # Revert task_list.json to pre-modification state
+#
+#   2. In extract_new_tasks(), validate before returning:
+#      - Check that new task depends_on IDs exist
+#      - Check that adding the new task doesn't create a cycle
+#      - Reject and log invalid proposals
+
+
+# ============================================================
+# P2-7: Dependency Context Size Control
+# ============================================================
+#
+# Problem:
+#   load_dependency_context() (run.py:93-120) concatenates all
+#   dependency summaries without any size limit. If a task has 10
+#   dependencies each with 50KB summaries, the prompt gets 500KB
+#   of context, leaving little room for the agent's actual work.
+#
+# Goal:
+#   Cap total dependency context and prioritize the most relevant deps.
+#
+# Implementation:
+#
+#   1. Add MAX_DEPENDENCY_CONTEXT_LEN = 30_000 (characters).
+#
+#   2. In load_dependency_context():
+#      - Sort dependencies by relevance (direct deps first, transitive later)
+#      - Truncate each summary if needed
+#      - Stop adding summaries when total exceeds the limit
+#      - Add a note: "(N more dependency summaries truncated)"
+#
+#   3. For the structured JSON summaries (P0-3), include only
+#      file lists and diff stats by default, not full diffs.
+
+
+# ============================================================
+# P2-8: test_changes.py Portability
+# ============================================================
+#
+# Problem:
+#   test_changes.py has hardcoded absolute paths:
+#     sys.path.insert(0, "/home/lida/auto-coder/best_claude/auto-coder-claude-code")
+#     PROMPTS = Path("/home/lida/auto-coder/best_claude/auto-coder-claude-code/prompts")
+#   This breaks if the code is moved, cloned elsewhere, or run by
+#   a different user.
+#
+# Goal:
+#   Use relative paths so tests work from any location.
+#
+# Implementation:
+#
+#   1. Replace hardcoded paths with relative:
+#        SCRIPT_DIR = Path(__file__).parent
+#        sys.path.insert(0, str(SCRIPT_DIR))
+#        PROMPTS = SCRIPT_DIR / "prompts"
+#
+#   2. Update test imports to use the local module copies.
+
+
+# ============================================================
+# P2-9: Thread-Safe Logging
+# ============================================================
+#
+# Problem:
+#   Multiple agent threads call print() concurrently, causing
+#   interleaved output:
+#     "  ✓ Task #1: DONE (5.1  ✓ Task #2: DONE (3.2s)\ns)"
+#
+# Goal:
+#   Atomic log output per line. Each agent's output is clearly separated.
+#
+# Implementation:
+#
+#   1. Create a thread-safe print wrapper:
+#        import threading
+#        _print_lock = threading.Lock()
+#        def safe_print(*args, **kwargs):
+#            with _print_lock:
+#                print(*args, **kwargs)
+#
+#   2. Replace all print() calls in run.py and worker.py with safe_print().
+#
+#   3. Already implemented in worker.py: each line has [Task#N] prefix.
+#      Ensure this is consistent across all output.
+
+
+# ============================================================
+# Final Updated Summary
+# ============================================================
+#
+# Files to modify:
+#   - worker.py: remove --dangerously-skip-permissions, add two-zone
+#     permission generation, fix subprocess deadlock (threaded stderr),
+#     add session timeout enforcement, add output size cap, add process
+#     tracking for graceful shutdown, accept review-only tool sets
+#   - run.py: per-task commit, git-based context sharing, droid review,
+#     cross-validation, worktree isolation, task proposals, timeout wiring,
+#     cost budget, graceful interrupt, dependency context size cap,
+#     thread-safe logging, new CLI args
+#   - scheduler.py: add threading.Lock for task_list.json access, add
+#     atomic file write, add apply_task_proposals(), add commit_hash
+#     field handling, add DAG validation after dynamic task insertion
+#   - git_ops.py: add threading.Lock for git operations, add
+#     create_worktree(), merge_worktree(), cleanup_worktree(),
+#     update .gitignore
+#   - planner.py: add task field validation, fix greedy JSON regex,
+#     add plan review step (P2-5)
+#   - progress.py: add state file writing, improve log formatting (P2-6)
+#   - test_changes.py: fix hardcoded paths, update tests for all new features
+#
+# Files to create:
+#   - prompts/review_prompt.md: single-reviewer prompt template
+#   - prompts/review_functional.md: functional review perspective
+#   - prompts/review_security.md: security review perspective
+#
+# Files to delete:
+#   - None (all changes are modifications to existing files)
+#
+# New CLI arguments:
+#   --sandbox / --no-sandbox       (default: True)
+#   --review-model MODEL           (default: claude-sonnet-4-6)
+#   --review-mode single|cross     (default: single)
+#   --worktree-isolation           (default: False)
+#   --max-cost FLOAT               (default: None = unlimited)
+#   --max-task-cost FLOAT          (default: None = unlimited)
+#   --max-retries INT              (default: 3)
+#   --review-plan                  (default: False)
+#   --replan                       (default: False)
+#   --dashboard                    (default: False)
+#
+# Full priority order:
+#   P0 (must fix — correctness/security):
+#     1. Permission sandboxing with two-zone model (read everywhere, write only in project_dir)
+#     2. Per-task git commit
+#     3. Reliable git-based context sharing
+#     4. Fix subprocess deadlock in worker.py (threaded stderr reading)
+#     5. Fix race condition on task_list.json (threading.Lock + atomic write)
+#     6. Git operation thread safety (threading.Lock)
+#
+#   P1 (high value — quality/reliability):
+#     1. Droid-based review (replace HTTP API with Claude Code agent)
+#     2. Multi-reviewer cross-validation
+#     3. Git worktree isolation for parallel tasks
+#     4. Cost budget and circuit breaker
+#     5. Graceful interrupt and resume
+#     6. Planner task field validation and regex fix
+#     7. Dynamic task DAG validation (validate after every modification)
+#
+#   P2 (nice to have — polish/extensibility):
+#     1. Dynamic task graph modification (file-based proposals)
+#     2. Improved file conflict detection (git-based fallback)
+#     3. Test timeout and session timeout enforcement
+#     4. Structured agent output protocol
+#     5. Planner quality — spec validation and re-planning
+#     6. Progress dashboard (real-time monitoring)
+#     7. Dependency context size control
+#     8. test_changes.py portability (fix hardcoded paths)
+#     9. Thread-safe logging
